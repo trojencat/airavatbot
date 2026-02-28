@@ -71,7 +71,6 @@ def main():
     cmd = [
         sys.executable, "-m", "PyInstaller",
         str(spec_file),
-        "--onefile",
         "--distpath", str(release_path / "dist")
     ]
 

@@ -1,6 +1,6 @@
 # ⚡ Airavat — Daemon
 
-FastAPI server for the Airavat MCP Agent. Handles LLM communication, MCP server management, and configuration.
+Airavat MCP Agent. Handles LLM communication, MCP server management, and configuration.
 
 ## Setup
 

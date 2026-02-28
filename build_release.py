@@ -72,9 +72,7 @@ def main():
         sys.executable, "-m", "PyInstaller",
         str(spec_file),
         "--onefile",
-        "--distpath", str(release_path / "dist"),
-        "--buildpath", str(release_path / "build"),
-        "--specpath", str(release_path),
+        "--distpath", str(release_path / "dist")
     ]
 
     result = subprocess.run(cmd, cwd=str(daemon_dir))

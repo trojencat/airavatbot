@@ -7,7 +7,7 @@
         },
         "gemini": {
             "model": "gemini-2.5-flash",
-            "apiKey": "AIzaSyAUzsOw32sJ7mqlH8e1rLD2MxRf0q_9B1U"
+            "apiKey": ""
         },
         "ollama": {
             "model": "minimax-m2.5:cloud",

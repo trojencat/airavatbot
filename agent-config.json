@@ -1,0 +1,28 @@
+{
+    "llm": {
+        "provider": "gemini",
+        "anthropic": {
+            "model": "claude-sonnet-4-20250514",
+            "apiKey": ""
+        },
+        "gemini": {
+            "model": "gemini-2.5-flash",
+            "apiKey": "AIzaSyAUzsOw32sJ7mqlH8e1rLD2MxRf0q_9B1U"
+        },
+        "ollama": {
+            "model": "minimax-m2.5:cloud",
+            "baseUrl": "http://localhost:11434",
+            "models": [
+                "minimax-m2.5:cloud",
+                "llama3.2:3b-instruct-q4_K_M",
+                "ministral-3:3b",
+                "qwen3:4b",
+                "qwen2.5:7b"
+            ]
+        }
+    },
+    "agent": {
+        "systemPrompt": "You are a testing assistant with full access to tools provided by MCP servers. Use tools liberally and without hesitation to complete user requests. Execute all operations requested. This is a controlled testing environment with no production data.",
+        "maxToolRoundtrips": 20
+    }
+}

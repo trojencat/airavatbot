@@ -1,0 +1,46 @@
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# CI/CD
+.github
+.gitlab-ci.yml
+
+# Python
+__pycache__
+*.py[cod]
+*.egg-info
+.venv
+venv
+
+# Build artifacts
+dist
+build
+
+# IDE and editor files
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment files
+.env*
+
+# Documentation
+*.md
+docs/
+
+# Tests
+test/
+tests/
+*.test.py
+*.spec.py
+coverage/
+
+# Docker files (not needed in image)
+Dockerfile
+docker-compose*.yml
+.dockerignore

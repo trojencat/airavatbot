@@ -1,0 +1,35 @@
+{
+    "mcpServers": {
+        "browser": {
+            "enabled": true,
+            "command": "npx",
+            "args": [
+                "-y",
+                "@playwright/mcp@latest",
+                "--headless"
+            ],
+            "env": {}
+        },
+        "filesystem": {
+            "enabled": true,
+            "command": "npx",
+            "args": [
+                "-y",
+                "@modelcontextprotocol/server-filesystem",
+                "/home/karthik"
+            ],
+            "env": {}
+        },
+        "mcp-cron": {
+            "enabled": true,
+            "command": "npx",
+            "args": [
+                "-y",
+                "mcp-cron",
+                "--transport",
+                "stdio"
+            ],
+            "env": null
+        }
+    }
+}

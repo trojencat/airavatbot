@@ -44,3 +44,7 @@ docker-compose.override.yml
 
 # Cache
 .cache/
+
+
+#Conversation data
+data/

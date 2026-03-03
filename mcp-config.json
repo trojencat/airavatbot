@@ -6,7 +6,10 @@
             "args": [
                 "-y",
                 "@playwright/mcp@latest",
-                "--headless"
+                "--browser",
+                "chromium",
+                "--user-data-dir",
+                "./tmp/playwright"
             ],
             "env": {}
         },

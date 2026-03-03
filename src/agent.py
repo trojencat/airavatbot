@@ -1,6 +1,8 @@
 import json
 import time
-from typing import List, Any
+import asyncio
+from typing import List, Any, Callable, Awaitable, Optional
+import uuid
 
 import anthropic
 import google.generativeai as genai
@@ -8,6 +10,8 @@ from ollama import Client as OllamaClient
 
 from .config import AgentConfigModel, get_active_llm
 from .mcp_manager import MCPServerManager, AggregatedTool
+from .storage import Storage, Conversation, Message, ToolCallInfoModel
+from .context import get_context
 
 # ── Types ─────────────────────────────────────────────────────────
 
@@ -48,9 +52,10 @@ def mcp_tools_to_anthropic(tools: List[AggregatedTool]) -> List[dict]:
 
 async def run_anthropic_agent(
     message: str,
-    history: List[dict],
+    history: List[Message],
     config: AgentConfigModel,
     manager: MCPServerManager,
+    status_cb: Callable[[str, Optional[dict]], Awaitable[None]]
 ) -> ChatResponse:
     llm = config.llm.anthropic
     if not llm.apiKey:
@@ -61,7 +66,19 @@ async def run_anthropic_agent(
     system_prompt = config.agent.systemPrompt
     max_roundtrips = config.agent.maxToolRoundtrips
 
-    history.append({"role": "user", "content": message})
+    #create the context of the message
+    context = await get_context(message, config)
+
+    # Reconstruct raw history for the LLM
+    api_history = []
+    for msg in history:
+        # A message context is a list of blocks or just string
+        api_history.append({"role": msg.role, "content": msg.context})
+
+    user_msg_id = str(uuid.uuid4())
+    api_history.append({"role": "user", "content": message})
+    history.append(Message(id=user_msg_id, role="user", message=message, context=context))
+    await status_cb("Thinking...")
 
     all_tool_calls: List[ToolCallInfo] = []
     roundtrip = 0
@@ -73,7 +90,7 @@ async def run_anthropic_agent(
             "model": llm.model,
             "max_tokens": 4096,
             "system": system_prompt,
-            "messages": history,
+            "messages": api_history,
         }
         if tools:
             api_args["tools"] = tools
@@ -90,7 +107,21 @@ async def run_anthropic_agent(
                 tool_use_blocks.append(block)
 
         # Append assistant's response to history
-        history.append({"role": "assistant", "content": [b.model_dump() for b in response.content]})
+        assistant_content = [b.model_dump() for b in response.content]
+        api_history.append({"role": "assistant", "content": assistant_content})
+        assistant_context = await get_context("\n".join(text_parts), config)
+        assistant_text = "\n".join(text_parts)
+        ast_msg_id = str(uuid.uuid4())
+        
+
+        # We will update tool_calls_info incrementally below
+        history.append(Message(
+            id=ast_msg_id,
+            role="assistant",
+            message=assistant_text,
+            context=assistant_context,
+            tool_calls=[]
+        ))
 
         if not tool_use_blocks or response.stop_reason == "end_turn":
             return ChatResponse("\n".join(text_parts), all_tool_calls)
@@ -99,10 +130,14 @@ async def run_anthropic_agent(
 
         for block in tool_use_blocks:
             tool_info = ToolCallInfo(block.id, block.name, block.input)
+            tc_model = ToolCallInfoModel(id=block.id, name=block.name, input=block.input)
+            
+            await status_cb(f"Calling tool: {block.name}", tc_model.model_dump())
 
             try:
                 result = await manager.call_tool(block.name, block.input)
                 tool_info.result = result
+                tc_model.result = result
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -111,6 +146,7 @@ async def run_anthropic_agent(
             except Exception as e:
                 err_msg = str(e)
                 tool_info.result = {"error": err_msg}
+                tc_model.result = {"error": err_msg}
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -119,8 +155,20 @@ async def run_anthropic_agent(
                 })
 
             all_tool_calls.append(tool_info)
+            # Find the most recently added assistant message to inject the tool call representation
+            history[-1].tool_calls.append(tc_model)
 
-        history.append({"role": "user", "content": tool_results})
+        api_history.append({"role": "user", "content": tool_results})
+        
+        user_tool_msg_id = str(uuid.uuid4())
+        history.append(Message(
+            id=user_tool_msg_id,
+            role="user",
+            message="", # UI shouldn't show raw tool result blocks typically
+            context=tool_results
+        ))
+        
+        await status_cb("Analyzing tool results...")
 
     return ChatResponse("[Max tool roundtrips reached]", all_tool_calls)
 
@@ -198,9 +246,10 @@ def _replace_types_for_gemini(schema: dict):
 
 async def run_gemini_agent(
     message: str,
-    history: List[dict],
+    history: List[Message],
     config: AgentConfigModel,
     manager: MCPServerManager,
+    status_cb: Callable[[str, Optional[dict]], Awaitable[None]]
 ) -> ChatResponse:
     llm = config.llm.gemini
     if not llm.apiKey:
@@ -221,17 +270,27 @@ async def run_gemini_agent(
 
     model = genai.GenerativeModel(**model_kwargs) # type: ignore
 
-    history.append({"role": "user", "parts": [message]})
+    api_history = []
+    for msg in history:
+        # Gemini expects "model" instead of "assistant"
+        role = "model" if msg.role == "assistant" else "user"
+        api_history.append({"role": role, "parts": msg.context})
+
+    user_msg_id = str(uuid.uuid4())
+    user_context = await get_context(message, config)
+    api_history.append({"role": "user", "parts": message})
+    history.append(Message(id=user_msg_id, role="user", message=message, context=user_context))
     all_tool_calls: List[ToolCallInfo] = []
     roundtrip = 0
+    await status_cb("Thinking...")
 
     while roundtrip < max_roundtrips:
         roundtrip += 1
 
         # Use the google-generativeai chat interface
         # We need to reshape slightly because genai.start_chat takes standard formats
-        chat = model.start_chat(history=history[:-1]) # type: ignore
-        last_msg = history[-1]["parts"]
+        chat = model.start_chat(history=api_history[:-1]) # type: ignore
+        last_msg = api_history[-1]["parts"]
         
         try:
             response = await chat.send_message_async(last_msg)
@@ -260,10 +319,22 @@ async def run_gemini_agent(
                 })
 
         # The SDK's start_chat appends to its internal history, but we maintain ours manually for tool rounds
-        history.append({
+        assistant_parts = [p for p in candidate.content.parts]
+        api_history.append({
             "role": "model", 
-            "parts": [p for p in candidate.content.parts]
+            "parts": assistant_parts
         })
+        
+        assistant_text = "\n".join(text_parts)
+        ast_msg_id = str(uuid.uuid4())
+        assistant_context = await get_context(assistant_text, config)
+        history.append(Message(
+            id=ast_msg_id,
+            role="assistant",
+            message=assistant_text,
+            context=assistant_context,
+            tool_calls=[]
+        ))
 
         if not function_calls:
             return ChatResponse("\n".join(text_parts), all_tool_calls)
@@ -274,10 +345,14 @@ async def run_gemini_agent(
             import random
             call_id = f"gemini_{int(time.time())}_{''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=6))}"
             tool_info = ToolCallInfo(call_id, fc["name"], fc["args"])
+            tc_model = ToolCallInfoModel(id=call_id, name=fc["name"], input=fc["args"])
+            
+            await status_cb(f"Calling tool: {fc['name']}", tc_model.model_dump())
 
             try:
                 result = await manager.call_tool(fc["name"], fc["args"])
                 tool_info.result = result
+                tc_model.result = result
                 function_responses.append({
                     "function_response": {
                         "name": fc["name"], 
@@ -287,6 +362,7 @@ async def run_gemini_agent(
             except Exception as e:
                 err_msg = str(e)
                 tool_info.result = {"error": err_msg}
+                tc_model.result = {"error": err_msg}
                 function_responses.append({
                     "function_response": {
                         "name": fc["name"], 
@@ -295,6 +371,7 @@ async def run_gemini_agent(
                 })
 
             all_tool_calls.append(tool_info)
+            history[-1].tool_calls.append(tc_model)
 
         # We must package the parts properly for the next round
         parts = []
@@ -310,7 +387,14 @@ async def run_gemini_agent(
                 response=s
             )))
             
-        history.append({"role": "user", "parts": parts})
+        api_history.append({"role": "user", "parts": parts})
+        history.append(Message(
+            id=str(uuid.uuid4()),
+            role="user",
+            message="",
+            context=parts
+        ))
+        await status_cb("Analyzing tool results...")
 
     return ChatResponse("[Max tool roundtrips reached]", all_tool_calls)
 
@@ -331,9 +415,10 @@ def mcp_tools_to_ollama(tools: List[AggregatedTool]) -> List[dict]:
 
 async def run_ollama_agent(
     message: str,
-    history: List[dict],
+    history: List[Message],
     config: AgentConfigModel,
     manager: MCPServerManager,
+    status_cb: Callable[[str, Optional[dict]], Awaitable[None]]
 ) -> ChatResponse:
     llm = config.llm.ollama
     from ollama import AsyncClient
@@ -342,13 +427,33 @@ async def run_ollama_agent(
     tools = mcp_tools_to_ollama(manager.get_all_tools())
     max_roundtrips = config.agent.maxToolRoundtrips
 
-    if not history or history[0].get("role") != "system":
-        history.insert(0, {"role": "system", "content": config.agent.systemPrompt})
+    api_history = []
+    if not history or history[0].role != "system":
+        api_history.insert(0, {"role": "system", "content": config.agent.systemPrompt})
+    
+    for msg in history:
+        # Rebuild dictionary context for Ollama. It uses "content" and sometimes "tool_calls" arrays
+        d = {"role": msg.role, "content": msg.context}
+        # In Ollama tool representations need to be properly translated, context already handles 'content'
+        if getattr(msg, 'context_extra', None):
+            d.update(msg.context_extra)
+        # Actually for simplicity let's stick to context being exactly the needed dictionary contents natively
+        if isinstance(msg.context, dict):
+            api_history.append(msg.context)
+        else:
+            block = {"role": msg.role, "content": msg.context}
+            if msg.role == "assistant" and msg.tool_calls:
+                block["tool_calls"] = [{"function": {"name": tc.name, "arguments": tc.input}} for tc in msg.tool_calls]
+            api_history.append(block)
 
-    history.append({"role": "user", "content": message})
+    context = await get_context(message, config)
+    
+    api_history.append({"role": "user", "content": message})
+    history.append(Message(id=str(uuid.uuid4()), role="user", message=message, context=context))
 
     all_tool_calls: List[ToolCallInfo] = []
     roundtrip = 0
+    await status_cb("Thinking...")
 
     while roundtrip < max_roundtrips:
         roundtrip += 1
@@ -359,7 +464,7 @@ async def run_ollama_agent(
 
         api_args = {
             "model": model_name,
-            "messages": history,
+            "messages": api_history,
         }
         if tools:
             api_args["tools"] = tools
@@ -384,7 +489,17 @@ async def run_ollama_agent(
         if tool_calls_formatted:
             history_msg["tool_calls"] = tool_calls_formatted
             
-        history.append(history_msg)
+        api_history.append(history_msg)
+        
+        ast_msg_id = str(uuid.uuid4())
+        asst_msg_context = await get_context(assistant_msg.get("content") or "", config)
+        history.append(Message(
+            id=ast_msg_id,
+            role="assistant",
+            message=assistant_msg.get("content") or "",
+            context=asst_msg_context,
+            tool_calls=[]
+        ))
 
         if not assistant_msg.get("tool_calls"):
             return ChatResponse(assistant_msg.get("content") or "", all_tool_calls)
@@ -396,23 +511,47 @@ async def run_ollama_agent(
             tool_args = tc["function"]["arguments"]
             
             tool_info = ToolCallInfo(call_id, tool_name, tool_args)
+            tc_model = ToolCallInfoModel(id=call_id, name=tool_name, input=tool_args)
+
+            await status_cb(f"Calling tool: {tool_name}", tc_model.model_dump())
 
             try:
                 result = await manager.call_tool(tool_name, tool_args)
                 tool_info.result = result
-                history.append({
+                tc_model.result = result
+                api_history.append({
                     "role": "tool",
                     "content": json.dumps(result, ensure_ascii=False)
                 })
+                history.append(Message(
+                    id=str(uuid.uuid4()),
+                    role="tool",
+                    message="",
+                    context={"role": "tool", "content": json.dumps(result, ensure_ascii=False)}
+                ))
             except Exception as e:
                 err_msg = str(e)
                 tool_info.result = {"error": err_msg}
-                history.append({
+                tc_model.result = {"error": err_msg}
+                api_history.append({
                     "role": "tool",
                     "content": f"Error: {err_msg}"
                 })
+                history.append(Message(
+                    id=str(uuid.uuid4()),
+                    role="tool",
+                    message="",
+                    context={"role": "tool", "content": f"Error: {err_msg}"}
+                ))
 
             all_tool_calls.append(tool_info)
+            # Annotate previous assistant message
+            for m in reversed(history):
+                if m.role == "assistant":
+                    m.tool_calls.append(tc_model)
+                    break
+            
+        await status_cb("Analyzing tool results...")
 
     return ChatResponse("[Max tool roundtrips reached]", all_tool_calls)
 
@@ -421,28 +560,45 @@ async def run_ollama_agent(
 
 class ChatAgent:
     def __init__(self, config: AgentConfigModel, manager: MCPServerManager):
-        self.anthropic_history = []
-        self.gemini_history = []
-        self.ollama_history = []
         self.config = config
         self.manager = manager
+        self.history_lock = asyncio.Lock()
+        self.storage = Storage()
 
-    async def chat(self, message: str) -> dict:
+    async def chat(self, conversation_id: Optional[str], message: str, status_cb: Callable[[str, Optional[dict]], Awaitable[None]]) -> dict:
         active = get_active_llm(self.config)
         kind = active["kind"]
 
+        async with self.history_lock:
+            if not conversation_id:
+                conversation_id = str(uuid.uuid4())
+                convo_title = await get_context(message, self.config)
+                convo = Conversation(id=conversation_id, title=convo_title, created_at=time.time(), updated_at=time.time())
+            else:
+                convo = self.storage.get_conversation(conversation_id)
+                if not convo:
+                    convo_title = await get_context(message, self.config)
+                    convo = Conversation(id=conversation_id, title=convo_title, created_at=time.time(), updated_at=time.time())
+
+            # For safety make a local copy of messages list
+            local_history = list(convo.messages)
+
         if kind == "anthropic":
-            resp = await run_anthropic_agent(message, self.anthropic_history, self.config, self.manager)
+            resp = await run_anthropic_agent(message, local_history, self.config, self.manager, status_cb)
         elif kind == "gemini":
-            resp = await run_gemini_agent(message, self.gemini_history, self.config, self.manager)
+            resp = await run_gemini_agent(message, local_history, self.config, self.manager, status_cb)
         elif kind == "ollama":
-            resp = await run_ollama_agent(message, self.ollama_history, self.config, self.manager)
-        else:
-            raise ValueError(f"Unknown LLM kind {kind}")
+            resp = await run_ollama_agent(message, local_history, self.config, self.manager, status_cb)
             
-        return resp.to_dict()
+        async with self.history_lock:
+            # Add updated messages back and save
+            convo.messages = local_history
+            self.storage.save_conversation(convo)
+
+        res = resp.to_dict()
+        res["conversation_id"] = conversation_id
+        return res
 
     def clear_history(self):
-        self.anthropic_history.clear()
-        self.gemini_history.clear()
-        self.ollama_history.clear()
+        # With active persistence, 'clear_history' simply starts a new chat instead of wiping a global history
+        pass

@@ -2,9 +2,11 @@ import os
 import sys
 import json
 import logging
-import httpx
+import uuid
+import time
+import asyncio
 from contextlib import asynccontextmanager
-from typing import Any, Optional, List, Dict
+from typing import Any, Optional, List, Dict, Callable, Awaitable
 
 from fastapi import FastAPI, HTTPException, Request, Body, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, FileResponse
@@ -207,19 +209,48 @@ async def ws_config(ws: WebSocket):
 
 # ── Chat API ──────────────────────────────────────────────────
 
+active_processes: Dict[str, dict] = {}
+MAX_CONCURRENT_PROCESSES = 3
+
 @app.post("/api/chat")
 async def chat_endpoint(request: Request):
     body = await request.json()
     message = body.get("message")
+    conversation_id = body.get("conversation_id")
     if not message or not isinstance(message, str):
         raise HTTPException(status_code=400, detail="message is required and must be a string")
 
+    if len(active_processes) >= MAX_CONCURRENT_PROCESSES:
+        return {"reply": "Whoa there, eager beaver! My brain's already juggling too many tasks. Give me a sec to finish what I'm doing before throwing more at me! 🐘💨", "toolCalls": []}
+
+    process_id = str(uuid.uuid4())
+    snippet = message[:50] + ("..." if len(message) > 50 else "")
+    active_processes[process_id] = {
+        "id": process_id,
+        "query": snippet,
+        "status": "Initializing",
+        "started_at": time.time(),
+        "tool_calls": []
+    }
+    await event_bus.broadcast("process_update", active_processes)
+
+    async def status_cb(status: str, tool_call: Optional[dict] = None):
+        if process_id in active_processes:
+            active_processes[process_id]["status"] = status
+            if tool_call:
+                active_processes[process_id]["tool_calls"].append(tool_call)
+            await event_bus.broadcast("process_update", active_processes)
+
     try:
-        result = await agent.chat(message)
+        result = await agent.chat(conversation_id, message, status_cb)
         return result
     except Exception as e:
         logger.error(f"Chat error: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        if process_id in active_processes:
+            del active_processes[process_id]
+            await event_bus.broadcast("process_update", active_processes)
 
 @app.get("/api/servers")
 def get_servers():
@@ -235,6 +266,53 @@ def get_servers():
 @app.post("/api/clear")
 def clear_history():
     agent.clear_history()
+    return {"ok": True}
+
+@app.get("/api/chat/conversations")
+def get_conversations():
+    from .storage import Storage
+    storage = Storage()
+    return {"conversations": storage.list_conversations()}
+
+@app.get("/api/chat/conversations/{conversation_id}")
+def get_conversation(conversation_id: str):
+    from .storage import Storage
+    storage = Storage()
+    convo = storage.get_conversation(conversation_id)
+    if not convo:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    
+    # Send history in a UI-friendly format 
+    history = []
+    for msg in convo.messages:
+        # Don't show raw tool blocks to user natively unless there are tool calls inside them?
+        # Typically UI distinguishes role "user" and "assistant" and "tools"
+        if msg.role == "tool" or (msg.role == "user" and not msg.message):
+            # If we want UI to show tools from history, we need to pass them up natively.
+            # However ChatPage currently expects {role: 'tools', toolCalls: []} 
+            pass
+            
+        if msg.role == "assistant":
+            # Pass tool calls array to mimic runtime
+            tc_objs = []
+            if msg.tool_calls:
+                tc_objs = [tc.model_dump() for tc in msg.tool_calls]
+                history.append({"role": "tools", "toolCalls": tc_objs})
+            if msg.message:
+                history.append({"role": "assistant", "content": msg.message})
+                
+        elif msg.role == "user" and msg.message:
+            history.append({"role": "user", "content": msg.message})
+
+    return {"id": convo.id, "title": convo.title, "history": history}
+
+@app.delete("/api/chat/conversations/{conversation_id}")
+def delete_conversation(conversation_id: str):
+    from .storage import Storage
+    storage = Storage()
+    success = storage.delete_conversation(conversation_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Conversation not found")
     return {"ok": True}
 
 # ── Settings API: MCP Config ──────────────────────────────────
